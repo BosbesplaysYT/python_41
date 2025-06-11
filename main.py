@@ -525,42 +525,49 @@ class MainWindow(QMainWindow):
         self.central_stack.setCurrentIndex(0)  # start on welcome
         # docks
         # ─── Project sidebar uses self.project_dir ────────────────────────────
+        # ─── docks (project, find, git, md, term) ─────────────────────────
         self.project_sidebar = ProjectSidebar(self.project_dir)
         proj_dock = QDockWidget("Project", self)
         proj_dock.setWidget(self.project_sidebar)
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, proj_dock)
+
         self.find_dock = FindReplaceDock(self)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.find_dock)
-        self.git_dock = GitDock(self, os.getcwd())
+
+        self.git_dock  = GitDock(self, self.project_dir)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.git_dock)
-        self.md_dock = MarkdownDock(self)
+
+        self.md_dock   = MarkdownDock(self)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.md_dock)
+
         self.term_dock = TerminalDock(self)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.term_dock)
-        # autosave & recovery
-        self.autosave_dir = os.path.join(tempfile.gettempdir(), "nexus_autosaves")
-        os.makedirs(self.autosave_dir, exist_ok=True)
-        QTimer(self).start(30000); self.findChild(QTimer).timeout.connect(self.autosave_all)
-        # load plugins
-        self.plugins = load_plugins(self)
-        # new initial tab
-        self.editor_area.new_tab()
-        self.editor_area.tabs.currentChanged.connect(self.on_tab_changed)
 
-        # ─── Add “Open Folder…” under File ───────────────────────────────────
+        # ─── hook tab changes for welcome/editor switch ────────────────────
+        tabs = self.editor_area.tabs
+        tabs.currentChanged.connect(lambda i: self.central_stack.setCurrentIndex(1))
+        tabs.tabCloseRequested.connect(lambda _: QTimer.singleShot(0, self._check_tabs))
+
+        # ─── load plugins, but skip initial new_tab ────────────────────────
+        self.plugins = load_plugins(self)
+        # no self.editor_area.new_tab() here
+
+        # ─── File menu: Save, Open Folder … ──────────────────────────────
         file_menu = self.menuBar().addMenu("&File")
-        # Save action
         save_act = QAction("&Save", self)
         save_act.setShortcut("Ctrl+S")
         save_act.triggered.connect(self.save_file)
         file_menu.addAction(save_act)
+
         open_folder_act = QAction("Open &Folder...", self)
         open_folder_act.setShortcut("Ctrl+K")
         open_folder_act.triggered.connect(self.open_folder)
         file_menu.addAction(open_folder_act)
-        # menu / toolbar omitted for brevity—just wire new_tab, open, save, theme switcher, etc.
-        # LSP stub
-        # self.lsp = SomeLSPClient(self.editor_area)
+
+    # ────── helper to show welcome if no tabs ─────────────────────────────
+    def _check_tabs(self):
+        if self.editor_area.tabs.count() == 0:
+            self.central_stack.setCurrentIndex(0)
 
     # ─── Slot: Open a new project directory ────────────────────────────────
     def open_folder(self):
