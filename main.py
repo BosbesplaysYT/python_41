@@ -15,7 +15,6 @@ from PyQt6.QtCore import Qt, QTimer, QPoint, QSize, QRect, QThread, pyqtSignal, 
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from your_splash_module import NexusSplash
 from config import is_first_launch, mark_launched
-from onboarding import OnboardingScreen
 
 # ────── Utility: Theme Manager ────────────────────────────────────────────────
 def load_theme(path):
@@ -1218,7 +1217,6 @@ class MainWindow(QMainWindow):
         toggle_theme_act.triggered.connect(self.toggle_theme)
         view_menu.addAction(toggle_theme_act)
 
-
         # ─── Session state paths ──────────────────────────────────────────
         self.state_path = os.path.join(
             QStandardPaths.writableLocation(QStandardPaths.StandardLocation.ConfigLocation),
@@ -1455,25 +1453,23 @@ def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setStyleSheet(dark_stylesheet)
+    app.setWindowIcon(QIcon(":/nexus_icon.ico"))
 
     def launch_main_window():
         w = MainWindow()
         w.resize(1200, 800)
         w.show()
 
-    def launch_onboarding():
-        onboarding = OnboardingScreen(finish_callback=launch_main_window)
-        onboarding.show()
-        mark_launched()
-
     if is_first_launch():
-        splash = NexusSplash(next_step_callback=launch_onboarding)
+        # Show splash on first launch, then go straight to the main window
+        splash = NexusSplash(next_step_callback=launch_main_window)
         splash.show()
+        mark_launched()
     else:
+        # On subsequent launches, skip the splash/onboarding entirely
         launch_main_window()
 
     sys.exit(app.exec())
 
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
