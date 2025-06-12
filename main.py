@@ -13,6 +13,9 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QTimer, QPoint, QSize, QRect, QThread, pyqtSignal, QStandardPaths, QUrl
 from PyQt6.QtWebEngineWidgets import QWebEngineView
+from your_splash_module import NexusSplash
+from config import is_first_launch, mark_launched
+from onboarding import OnboardingScreen
 
 # ────── Utility: Theme Manager ────────────────────────────────────────────────
 def load_theme(path):
@@ -37,6 +40,260 @@ def load_theme(path):
         palette = QApplication.instance().style().standardPalette()
         formats = {}
     return palette, formats
+
+dark_stylesheet = """
+/* GENERAL */
+QWidget {
+    background-color: #2d2d2d;
+    color: #f0f0f0;
+    font-size: 14px;
+}
+
+/* QPushButton */
+QPushButton {
+    background-color: #3a3a3a;
+    color: #ffffff;
+    border: 1px solid #5a5a5a;
+    padding: 6px 12px;
+    border-radius: 4px;
+}
+QPushButton:hover {
+    background-color: #505050;
+}
+QPushButton:pressed {
+    background-color: #606060;
+}
+QPushButton:disabled {
+    background-color: #2d2d2d;
+    color: #888888;
+}
+
+/* QLineEdit, QTextEdit */
+QLineEdit, QTextEdit, QPlainTextEdit {
+    background-color: #1e1e1e;
+    color: #f0f0f0;
+    border: 1px solid #5a5a5a;
+    border-radius: 3px;
+    padding: 4px;
+}
+QLineEdit:disabled {
+    color: #888888;
+}
+
+/* QLabel */
+QLabel {
+    color: #e0e0e0;
+}
+
+/* QCheckBox, QRadioButton */
+QCheckBox, QRadioButton {
+    color: #e0e0e0;
+    spacing: 6px;
+}
+QCheckBox::indicator, QRadioButton::indicator {
+    width: 16px;
+    height: 16px;
+}
+QCheckBox::indicator:checked, QRadioButton::indicator:checked {
+    background-color: #5a5a5a;
+    border: 1px solid #888888;
+}
+
+/* QComboBox */
+QComboBox {
+    background-color: #3a3a3a;
+    color: #ffffff;
+    border: 1px solid #5a5a5a;
+    padding: 4px;
+}
+QComboBox QAbstractItemView {
+    background-color: #2d2d2d;
+    color: #f0f0f0;
+    selection-background-color: #505050;
+    border: 1px solid #5a5a5a;
+}
+
+/* QTabWidget */
+QTabWidget::pane {
+    border: 1px solid #444444;
+}
+QTabBar::tab {
+    background-color: #3a3a3a;
+    border: 1px solid #5a5a5a;
+    padding: 6px;
+}
+QTabBar::tab:selected {
+    background-color: #505050;
+}
+
+/* QScrollBar */
+QScrollBar:vertical, QScrollBar:horizontal {
+    background-color: #2d2d2d;
+    border: none;
+    width: 10px;
+    height: 10px;
+    margin: 0px;
+}
+QScrollBar::handle:vertical, QScrollBar::handle:horizontal {
+    background-color: #5a5a5a;
+    min-height: 20px;
+    min-width: 20px;
+}
+QScrollBar::add-line, QScrollBar::sub-line {
+    background: none;
+}
+QScrollBar::add-page, QScrollBar::sub-page {
+    background: none;
+}
+
+/* QProgressBar */
+QProgressBar {
+    border: 1px solid #5a5a5a;
+    text-align: center;
+    background-color: #1e1e1e;
+    color: #ffffff;
+}
+QProgressBar::chunk {
+    background-color: #5a5a5a;
+}
+
+/* QTableView, QListView, QTreeView */
+QTableView, QListView, QTreeView {
+    background-color: #1e1e1e;
+    color: #f0f0f0;
+    gridline-color: #444444;
+    selection-background-color: #505050;
+    selection-color: #ffffff;
+}
+QHeaderView::section {
+    background-color: #3a3a3a;
+    color: #f0f0f0;
+    border: 1px solid #444444;
+    padding: 4px;
+}
+"""
+
+light_stylesheet = """
+QWidget {
+    background-color: #f2f2f2;
+    color: #2d2d2d;
+    font-size: 14px;
+}
+
+/* QPushButton */
+QPushButton {
+    background-color: #e0e0e0;
+    color: #000000;
+    border: 1px solid #a0a0a0;
+    padding: 6px 12px;
+    border-radius: 4px;
+}
+QPushButton:hover {
+    background-color: #d0d0d0;
+}
+QPushButton:pressed {
+    background-color: #c0c0c0;
+}
+QPushButton:disabled {
+    background-color: #f2f2f2;
+    color: #888888;
+}
+
+/* QLineEdit, QTextEdit */
+QLineEdit, QTextEdit, QPlainTextEdit {
+    background-color: #ffffff;
+    color: #2d2d2d;
+    border: 1px solid #a0a0a0;
+    border-radius: 3px;
+    padding: 4px;
+}
+
+/* QLabel */
+QLabel {
+    color: #2d2d2d;
+}
+
+/* QCheckBox, QRadioButton */
+QCheckBox, QRadioButton {
+    color: #2d2d2d;
+    spacing: 6px;
+}
+QCheckBox::indicator, QRadioButton::indicator {
+    width: 16px;
+    height: 16px;
+}
+QCheckBox::indicator:checked, QRadioButton::indicator:checked {
+    background-color: #a0a0a0;
+    border: 1px solid #888888;
+}
+
+/* QComboBox */
+QComboBox {
+    background-color: #e0e0e0;
+    color: #000000;
+    border: 1px solid #a0a0a0;
+    padding: 4px;
+}
+QComboBox QAbstractItemView {
+    background-color: #f2f2f2;
+    color: #2d2d2d;
+    selection-background-color: #d0d0d0;
+    border: 1px solid #a0a0a0;
+}
+
+/* QTabWidget */
+QTabWidget::pane {
+    border: 1px solid #cccccc;
+}
+QTabBar::tab {
+    background-color: #e0e0e0;
+    border: 1px solid #b0b0b0;
+    padding: 6px;
+}
+QTabBar::tab:selected {
+    background-color: #d0d0d0;
+}
+
+/* QScrollBar */
+QScrollBar:vertical, QScrollBar:horizontal {
+    background-color: #f2f2f2;
+    border: none;
+    width: 10px;
+    height: 10px;
+    margin: 0px;
+}
+QScrollBar::handle:vertical, QScrollBar::handle:horizontal {
+    background-color: #b0b0b0;
+    min-height: 20px;
+    min-width: 20px;
+}
+
+/* QProgressBar */
+QProgressBar {
+    border: 1px solid #a0a0a0;
+    text-align: center;
+    background-color: #ffffff;
+    color: #000000;
+}
+QProgressBar::chunk {
+    background-color: #a0a0a0;
+}
+
+/* QTableView, QListView, QTreeView */
+QTableView, QListView, QTreeView {
+    background-color: #ffffff;
+    color: #2d2d2d;
+    gridline-color: #cccccc;
+    selection-background-color: #d0d0d0;
+    selection-color: #000000;
+}
+QHeaderView::section {
+    background-color: #e0e0e0;
+    color: #2d2d2d;
+    border: 1px solid #b0b0b0;
+    padding: 4px;
+}
+"""
 
 class SearchWorker(QThread):
     # file path, line number, line text
@@ -879,6 +1136,9 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Nexus Editor 2.0")
         # ─── keep track of the current project directory ───────────────────────
         self.project_dir = os.getcwd()
+
+        self.dark_mode_enabled = True  # default to dark mode
+        self.apply_theme()
         # load theme
         pal, fmts = load_theme("themes/dracula.json")
         QApplication.instance().setPalette(pal)
@@ -944,11 +1204,20 @@ class MainWindow(QMainWindow):
         open_folder_act.triggered.connect(self.open_folder)
         file_menu.addAction(open_folder_act)
 
+        # ─── View Menu: Split, Toggle Theme ─────────────────────────────
         view_menu = self.menuBar().addMenu("&View")
+
         split_act = QAction("Split &Editor", self)
         split_act.setShortcut("Ctrl+\\")
         split_act.triggered.connect(self.editor_area.split_current)
         view_menu.addAction(split_act)
+
+        # 👇 Add theme toggle action here
+        toggle_theme_act = QAction("Toggle &Theme", self)
+        toggle_theme_act.setShortcut("Ctrl+T")
+        toggle_theme_act.triggered.connect(self.toggle_theme)
+        view_menu.addAction(toggle_theme_act)
+
 
         # ─── Session state paths ──────────────────────────────────────────
         self.state_path = os.path.join(
@@ -959,6 +1228,16 @@ class MainWindow(QMainWindow):
 
         # ─── Now restore last session ────────────────────────────────────
         self.load_state()
+
+    def apply_theme(self):
+        if self.dark_mode_enabled:
+            self.setStyleSheet(dark_stylesheet)
+        else:
+            self.setStyleSheet(light_stylesheet)
+
+    def toggle_theme(self):
+        self.dark_mode_enabled = not self.dark_mode_enabled
+        self.apply_theme()
 
     def load_state(self):
         """Restore last project folder, open tabs, and window geometry."""
@@ -1172,31 +1451,29 @@ class MainWindow(QMainWindow):
         super().closeEvent(ev)
 
 
-if __name__ == "__main__":
+def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    app.setStyleSheet(dark_stylesheet)
 
-    # Create custom dark palette
-    palette = QPalette()
-    palette.setColor(QPalette.ColorRole.Window, QColor(53, 53, 53))
-    palette.setColor(QPalette.ColorRole.WindowText, Qt.GlobalColor.white)
-    palette.setColor(QPalette.ColorRole.Base, QColor(35, 35, 35))
-    palette.setColor(QPalette.ColorRole.AlternateBase, QColor(53, 53, 53))
-    palette.setColor(QPalette.ColorRole.ToolTipBase, Qt.GlobalColor.white)
-    palette.setColor(QPalette.ColorRole.ToolTipText, Qt.GlobalColor.white)
-    palette.setColor(QPalette.ColorRole.Text, Qt.GlobalColor.white)
-    palette.setColor(QPalette.ColorRole.Button, QColor(53, 53, 53))
-    palette.setColor(QPalette.ColorRole.ButtonText, Qt.GlobalColor.white)
-    palette.setColor(QPalette.ColorRole.BrightText, Qt.GlobalColor.red)
-    palette.setColor(QPalette.ColorRole.Link, QColor(42, 130, 218))
-    palette.setColor(QPalette.ColorRole.Highlight, QColor(42, 130, 218))
-    palette.setColor(QPalette.ColorRole.HighlightedText, Qt.GlobalColor.black)
+    def launch_main_window():
+        w = MainWindow()
+        w.resize(1200, 800)
+        w.show()
 
-    app.setPalette(palette)
+    def launch_onboarding():
+        onboarding = OnboardingScreen(finish_callback=launch_main_window)
+        onboarding.show()
+        mark_launched()
 
-    # Main window setup
-    w = MainWindow()
-    w.resize(1200, 800)
-    w.show()
+    if is_first_launch():
+        splash = NexusSplash(next_step_callback=launch_onboarding)
+        splash.show()
+    else:
+        launch_main_window()
 
     sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
