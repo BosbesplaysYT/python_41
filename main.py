@@ -1,5 +1,5 @@
 # main.py
-import sys, os, json, subprocess, tempfile, traceback, shutil
+import sys, os, json, subprocess, re, traceback, shutil
 import markdown
 from PIL import Image
 from PIL.ImageQt import ImageQt
@@ -8,9 +8,10 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QSplitter, QTabWidget, QPlainTextEdit,
     QTreeView, QDockWidget, QLineEdit, QPushButton, QListWidget,
     QTextEdit, QLabel, QVBoxLayout, QHBoxLayout, QMessageBox,
-    QFileDialog, QInputDialog, QMenu, QAbstractItemView, QStackedWidget
+    QFileDialog, QInputDialog, QMenu, QAbstractItemView, QStackedWidget,
+    QCheckBox, QListWidgetItem
 )
-from PyQt6.QtCore import Qt, QTimer, QPoint, QSize, QRect
+from PyQt6.QtCore import Qt, QTimer, QPoint, QSize, QRect, QThread, pyqtSignal, QStandardPaths
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 
 # ────── Utility: Theme Manager ────────────────────────────────────────────────
@@ -36,6 +37,42 @@ def load_theme(path):
         palette = QApplication.instance().style().standardPalette()
         formats = {}
     return palette, formats
+
+class SearchWorker(QThread):
+    # file path, line number, line text
+    result_found = pyqtSignal(str, int, str)
+    search_done  = pyqtSignal()
+
+    def __init__(self, root, pattern, opts, parent=None):
+        super().__init__(parent)
+        self.root, self.pattern, self.opts = root, pattern, opts
+
+    def run(self):
+        # build regex
+        pat = self.pattern
+        flags = 0 if self.opts['case'] else re.IGNORECASE
+        if not self.opts['regex']:
+            pat = re.escape(pat)
+        if self.opts['whole']:
+            pat = r'\b' + pat + r'\b'
+        regex = re.compile(pat, flags)
+
+        for dirpath, _, files in os.walk(self.root):
+            for fn in files:
+                ext = os.path.splitext(fn)[1]
+                if self.opts['include'] and ext not in self.opts['include']:
+                    continue
+                if ext in self.opts['exclude']:
+                    continue
+                full = os.path.join(dirpath, fn)
+                try:
+                    with open(full, 'r', encoding='utf-8') as f:
+                        for i, line in enumerate(f, start=1):
+                            if regex.search(line):
+                                self.result_found.emit(full, i, line.rstrip())
+                except Exception:
+                    continue
+        self.search_done.emit()
 
 # ────── Plugin API Stub ─────────────────────────────────────────────────────
 class PluginInterface:
@@ -77,6 +114,12 @@ class CodeEditor(QPlainTextEdit):
     def __init__(self):
         super().__init__()
         self.lineNumberArea = LineNumberArea(self)  # ✅ Moved this line to the top
+        # after creating lineNumberArea:
+        self.blockCountChanged.connect(self.updateLineNumberAreaWidth)
+        self.updateRequest.connect(self.updateLineNumberArea)
+        # ensure we have the right margin from the start:
+        self.updateLineNumberAreaWidth(0)
+
         self.setFont(QFont("Fira Code", 12))
         self.cursorPositionChanged.connect(self.match_brackets)
         # Simplified minimap placeholder: will just draw a grey bar
@@ -132,7 +175,10 @@ class CodeEditor(QPlainTextEdit):
         painter.end()
 
     def update_viewport_margins(self):
-        self.setViewportMargins(0,0,80,0)
+        left = self.lineNumberAreaWidth()
+        right = 80  # your minimap
+        self.setViewportMargins(left, 0, right, 0)
+
     def match_brackets(self):
         tc = self.textCursor()
         pos = tc.position()
@@ -178,7 +224,7 @@ class EditorArea(QWidget):
         super().__init__()
         self.tabs = QTabWidget()
         self.tabs.setTabsClosable(True)
-        self.tabs.tabCloseRequested.connect(self.close_tab)
+        self.tabs.tabCloseRequested.connect(self.close_primary_tab)
 
         # secondary tabs for the split pane (created on first split)
         self.secondary_tabs = None
@@ -342,16 +388,20 @@ class EditorArea(QWidget):
             if text.endswith(dot):
                 self.tabs.setTabText(idx, text[:-len(dot)])
 
-    def close_tab(self, i):
-        # if we’re closing in the secondary pane
-        if self.secondary_tabs and self.secondary_tabs.widget(i):
-            self.secondary_tabs.removeTab(i)
-            # if secondary is now empty, remove it
-            if self.secondary_tabs.count() == 0:
-                self.splitter.widget(1).deleteLater()
-                self.secondary_tabs = None
-        else:
-            self.tabs.removeTab(i)
+    def close_primary_tab(self, index):
+        self.tabs.removeTab(index)
+        # if you want to automatically collapse the split when both are gone:
+        if self.tabs.count() == 0 and self.secondary_tabs:
+            self.splitter.widget(1).deleteLater()
+            self.secondary_tabs = None
+
+    def close_secondary_tab(self, index):
+        if not self.secondary_tabs:
+            return
+        self.secondary_tabs.removeTab(index)
+        if self.secondary_tabs.count() == 0:
+            self.splitter.widget(1).deleteLater()
+            self.secondary_tabs = None
 
     def split_current(self):
         ed = self.current_editor()
@@ -361,7 +411,7 @@ class EditorArea(QWidget):
         if not self.secondary_tabs:
             self.secondary_tabs = QTabWidget()
             self.secondary_tabs.setTabsClosable(True)
-            self.secondary_tabs.tabCloseRequested.connect(self.close_tab)
+            self.secondary_tabs.tabCloseRequested.connect(self.close_secondary_tab)
             self.splitter.addWidget(self.secondary_tabs)
 
         # clone the editor into the split pane
@@ -559,25 +609,171 @@ class ProjectSidebar(QWidget):
         event.accept()
 
 # ────── Find & Replace Dock ──────────────────────────────────────────────────
-class FindReplaceDock(QDockWidget):
+class SearchDock(QDockWidget):
     def __init__(self, parent):
-        super().__init__("Find / Replace", parent)
-        w=QWidget(); lay=QVBoxLayout(w)
-        self.find = QLineEdit(); self.find.setPlaceholderText("Find (regex)")
-        self.rep  = QLineEdit(); self.rep.setPlaceholderText("Replace")
-        b1=QPushButton("Find Next"); b2=QPushButton("Replace")
-        b1.clicked.connect(self.find_next); b2.clicked.connect(self.replace_one)
-        for x in (self.find, self.rep, b1, b2): lay.addWidget(x)
+        super().__init__("Search & Replace", parent)
+        self.parent = parent
+
+        # State for replace iteration
+        self.matches = []           # list of (file, line, start, length)
+        self.current_index = 0
+        self.last_tab = None
+
+        # — UI Setup —
+        w = QWidget(); lay = QVBoxLayout(w)
+
+        # 1) Replace-mode toggle (no separate Replace button)
+        self.replace_mode = QPushButton("Replace Mode OFF", checkable=True)
+        self.replace_mode.toggled.connect(self.on_toggle_replace)
+        lay.addWidget(self.replace_mode)
+
+        # 2) Search & Replace inputs
+        self.find = QLineEdit(); self.find.setPlaceholderText("Search pattern")
+        self.rep  = QLineEdit(); self.rep.setPlaceholderText("Replacement text")
+        self.rep.setEnabled(False)
+        # pressing Enter in rep field triggers one replace
+        self.rep.returnPressed.connect(self.replace_next)
+        lay.addWidget(self.find)
+        lay.addWidget(self.rep)
+
+        # 3) Options
+        opts = QHBoxLayout()
+        self.use_regex      = QCheckBox("Regex")
+        self.case_sensitive = QCheckBox("Case-sensitive")
+        self.whole_word     = QCheckBox("Whole word")
+        opts.addWidget(self.use_regex)
+        opts.addWidget(self.case_sensitive)
+        opts.addWidget(self.whole_word)
+        lay.addLayout(opts)
+
+        # 4) File filters
+        filt = QHBoxLayout()
+        self.include_ext = QLineEdit(); self.include_ext.setPlaceholderText("Include: .py,.js")
+        self.exclude_ext = QLineEdit(); self.exclude_ext.setPlaceholderText("Exclude: .min.js")
+        filt.addWidget(self.include_ext)
+        filt.addWidget(self.exclude_ext)
+        lay.addLayout(filt)
+
+        # 5) Search button
+        btn = QPushButton("Search")
+        btn.clicked.connect(self.start_search)
+        lay.addWidget(btn)
+
+        # 6) Results list
+        self.results = QListWidget()
+        self.results.itemActivated.connect(self.open_result)
+        lay.addWidget(self.results)
+
         self.setWidget(w)
-    def find_next(self):
-        ed = self.parent().editor_area.current_editor()
-        flag = QTextDocument.FindFlag(0)
-        ed.find(self.find.text(), flag)
-    def replace_one(self):
-        ed = self.parent().editor_area.current_editor()
-        tc=ed.textCursor()
-        if tc.hasSelection():
-            tc.insertText(self.rep.text())
+
+    def on_toggle_replace(self, on):
+        # enable the rep input when in replace mode
+        self.rep.setEnabled(on)
+        self.replace_mode.setText("Replace Mode ON" if on else "Replace Mode OFF")
+        # reset iteration state
+        self.matches = []
+        self.current_index = 0
+        if on:
+            # build a fresh list of matches from results
+            self._build_match_list()
+
+    def _build_match_list(self):
+        """Turn each QListWidgetItem into a precise (file,line,start,len) tuple."""
+        pat = self.find.text()
+        flags = 0 if self.case_sensitive.isChecked() else re.IGNORECASE
+        if not self.use_regex.isChecked():
+            pat = re.escape(pat)
+        if self.whole_word.isChecked():
+            pat = r'\b' + pat + r'\b'
+        regex = re.compile(pat, flags)
+
+        self.matches = []
+        for idx in range(self.results.count()):
+            it = self.results.item(idx)
+            file, line = it.data
+            # get the exact text of that line
+            with open(file, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+            text = lines[line-1]
+            m = regex.search(text)
+            if m:
+                self.matches.append((file, line, m.start(), m.end() - m.start()))
+
+    def start_search(self):
+        self.results.clear()
+        self.matches = []
+        self.current_index = 0
+
+        opts = {
+            'regex':   self.use_regex.isChecked(),
+            'case':    self.case_sensitive.isChecked(),
+            'whole':   self.whole_word.isChecked(),
+            'include': set(e.strip() for e in self.include_ext.text().split(',') if e.strip()),
+            'exclude': set(e.strip() for e in self.exclude_ext.text().split(',') if e.strip()),
+        }
+        root = self.parent.project_dir
+        pattern = self.find.text().strip()
+        if not pattern:
+            return
+
+        self.worker = SearchWorker(root, pattern, opts)
+        self.worker.result_found.connect(self.add_result)
+        self.worker.start()
+
+    def add_result(self, file, line, snippet):
+        item = QListWidgetItem(f"{os.path.relpath(file)}:{line}: {snippet}")
+        item.data = (file, line)
+        self.results.addItem(item)
+
+    def open_result(self, item):
+        # behaves like a normal “click result” during search mode
+        file, line = item.data
+        ed = self.parent.editor_area.new_tab(file)
+        tc = ed.textCursor()
+        block = ed.document().findBlockByLineNumber(line-1)
+        tc.setPosition(block.position())
+        ed.setTextCursor(tc)
+
+    def replace_next(self):
+        if not self.replace_mode.isChecked() or self.current_index >= len(self.matches):
+            return  # nothing to do
+
+        file, line, start, length = self.matches[self.current_index]
+
+        # 1) close previous tab
+        if self.last_tab is not None:
+            self.parent.editor_area.tabs.removeTab(self.last_tab)
+            self.last_tab = None
+
+        # 2) open this file
+        ed = self.parent.editor_area.new_tab(file)
+        self.last_tab = self.parent.editor_area.tabs.currentIndex()
+
+        # 3) move cursor & select
+        tc = ed.textCursor()
+        block = ed.document().findBlockByLineNumber(line-1)
+        tc.setPosition(block.position() + start)
+        # correct enum usage here:
+        tc.movePosition(QTextCursor.MoveOperation.Right,
+                        QTextCursor.MoveMode.KeepAnchor,
+                        length)
+        ed.setTextCursor(tc)
+
+        # 4) perform replacement
+        tc.insertText(self.rep.text())
+
+        # 5) save file immediately
+        # reuse your MainWindow.save_file logic:
+        mw = self.parent
+        mw.editor_area.tabs.setCurrentIndex(self.last_tab)
+        mw.save_file()
+
+        self.current_index += 1
+
+        # 6) if done, turn off replace mode
+        if self.current_index >= len(self.matches):
+            QMessageBox.information(self, "Done", "All replacements complete.")
+            self.replace_mode.setChecked(False)
 
 # ────── Git Status Dock ──────────────────────────────────────────────────────
 class GitDock(QDockWidget):
@@ -714,8 +910,8 @@ class MainWindow(QMainWindow):
         proj_dock.setWidget(self.project_sidebar)
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, proj_dock)
 
-        self.find_dock = FindReplaceDock(self)
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.find_dock)
+        self.search_dock = SearchDock(self)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.search_dock)
 
         self.git_dock  = GitDock(self, self.project_dir)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.git_dock)
@@ -812,6 +1008,7 @@ class MainWindow(QMainWindow):
             idx = self.editor_area.tabs.currentIndex()
             self.editor_area.tabs.setTabText(idx, os.path.basename(path))
 
+        # --- write out the current editor ---
         try:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(ed.toPlainText())
@@ -819,8 +1016,43 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Save Error", f"Could not save file:\n{e}")
             return
 
-        # clear modified flag → removes the dot
+        # clear modified flag on this editor
         ed.document().setModified(False)
+
+        # --- now reload any *other* tabs editing the same file ---
+        def reload_editor(other_ed):
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+            except Exception:
+                return
+            # remember cursor position
+            tc = other_ed.textCursor()
+            pos = tc.position()
+            # temporarily block signals so we don't trigger bracket‐match, modified‐flags, etc.
+            other_ed.blockSignals(True)
+            other_ed.setPlainText(content)
+            other_ed.blockSignals(False)
+            other_ed.document().setModified(False)
+            # restore cursor (clamped to content length)
+            pos = min(pos, len(content))
+            tc.setPosition(pos)
+            other_ed.setTextCursor(tc)
+
+        # update across both primary and split tabs
+        # primary tabs
+        for i in range(self.editor_area.tabs.count()):
+            other = self.editor_area.tabs.widget(i)
+            if getattr(other, 'file_path', None) == path and other is not ed:
+                reload_editor(other)
+        # secondary tabs (if you have a split pane)
+        st = self.editor_area.secondary_tabs
+        if st:
+            for i in range(st.count()):
+                other = st.widget(i)
+                if getattr(other, 'file_path', None) == path and other is not ed:
+                    reload_editor(other)
+
 
     def closeEvent(self, ev):
         # on close, prompt to recover if no real tabs open
