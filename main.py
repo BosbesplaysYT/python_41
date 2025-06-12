@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (
     QFileDialog, QInputDialog, QMenu, QAbstractItemView, QStackedWidget,
     QCheckBox, QListWidgetItem
 )
-from PyQt6.QtCore import Qt, QTimer, QPoint, QSize, QRect, QThread, pyqtSignal, QStandardPaths
+from PyQt6.QtCore import Qt, QTimer, QPoint, QSize, QRect, QThread, pyqtSignal, QStandardPaths, QUrl
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 
 # ────── Utility: Theme Manager ────────────────────────────────────────────────
@@ -288,6 +288,8 @@ class EditorArea(QWidget):
             label.setPixmap(pixmap)
             label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             layout.addWidget(label)
+
+            container.file_path = path
             
             # Add to tab
             idx = self.tabs.addTab(container, os.path.basename(path))
@@ -298,76 +300,78 @@ class EditorArea(QWidget):
             return self._open_text_tab(path)
 
     def _open_html_tab(self, path):
-        # Create split view
+        # Create splitter
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        
+
         # Left: Code editor
         editor = CodeEditor()
         editor.file_path = path
-        try:
-            with open(path, 'r', encoding='utf-8') as f:
-                content = f.read()
-        except:
-            with open(path, 'r', encoding='latin-1', errors='replace') as f:
-                content = f.read()
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            content = f.read()
         editor.setPlainText(content)
         editor.document().setModified(False)
-        
+
         # Right: Web view preview
         webview = QWebEngineView()
-        webview.setHtml(content)
-        
-        # Connect editor to update preview
-        editor.textChanged.connect(lambda: webview.setHtml(editor.toPlainText()))
-        
+        # load with correct base URL so <img src="..."> works
+        base = QUrl.fromLocalFile(path)
+        webview.setHtml(content, base)
+
+        # Connect editor to update preview live
+        editor.textChanged.connect(
+            lambda: webview.setHtml(editor.toPlainText(), base)
+        )
+
         splitter.addWidget(editor)
         splitter.addWidget(webview)
         splitter.setSizes([300, 300])
-        
+
+        # attach attributes for state + reload-on-save
+        splitter.file_path = path
+        splitter.editor   = editor
+        splitter.webview  = webview
+
         idx = self.tabs.addTab(splitter, os.path.basename(path))
         self.tabs.setCurrentIndex(idx)
         return splitter
 
+
     def _open_markdown_tab(self, path):
-        # Create split view
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        
-        # Left: Code editor
+
         editor = CodeEditor()
         editor.file_path = path
-        try:
-            with open(path, 'r', encoding='utf-8') as f:
-                content = f.read()
-        except:
-            with open(path, 'r', encoding='latin-1', errors='replace') as f:
-                content = f.read()
-        editor.setPlainText(content)
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            md = f.read()
+        editor.setPlainText(md)
         editor.document().setModified(False)
-        
-        # Right: Markdown preview
+
         preview = QTextEdit()
         preview.setReadOnly(True)
-        
-        # Convert and display
-        html = markdown.markdown(content)
-        preview.setHtml(html)
-        
-        # Connect editor to update preview
-        editor.textChanged.connect(lambda: self.update_markdown_preview(editor, preview))
-        
-        # Add sync scrolling
+        preview.setHtml(markdown.markdown(md))
+
+        editor.textChanged.connect(
+            lambda: self.update_markdown_preview(editor, preview)
+        )
+
+        # sync scrolling
         sb_ed = editor.verticalScrollBar()
         sb_md = preview.verticalScrollBar()
         sb_ed.valueChanged.connect(sb_md.setValue)
         sb_md.valueChanged.connect(sb_ed.setValue)
-        
+
         splitter.addWidget(editor)
         splitter.addWidget(preview)
         splitter.setSizes([300, 300])
-        
+
+        splitter.file_path = path
+        splitter.editor   = editor
+        splitter.preview  = preview
+
         idx = self.tabs.addTab(splitter, os.path.basename(path))
         self.tabs.setCurrentIndex(idx)
         return splitter
+
 
     def update_markdown_preview(self, editor, preview):
         source_md = editor.toPlainText()
@@ -946,6 +950,81 @@ class MainWindow(QMainWindow):
         split_act.triggered.connect(self.editor_area.split_current)
         view_menu.addAction(split_act)
 
+        # ─── Session state paths ──────────────────────────────────────────
+        self.state_path = os.path.join(
+            QStandardPaths.writableLocation(QStandardPaths.StandardLocation.ConfigLocation),
+            "nexus_state.json"
+        )
+        os.makedirs(os.path.dirname(self.state_path), exist_ok=True)
+
+        # ─── Now restore last session ────────────────────────────────────
+        self.load_state()
+
+    def load_state(self):
+        """Restore last project folder, open tabs, and window geometry."""
+        try:
+            with open(self.state_path, 'r', encoding='utf-8') as f:
+                state = json.load(f)
+        except Exception:
+            return  # nothing to restore
+
+        proj = state.get("project_dir")
+        tabs = state.get("open_tabs", [])
+        win_size = state.get("window_size")
+        win_pos = state.get("window_pos")
+
+        if proj and os.path.isdir(proj):
+            # change directory & update UI
+            os.chdir(proj)
+            self.project_dir = proj
+            self.setWindowTitle(f"Nexus Editor 2.0 — {os.path.basename(proj)}")
+            model = self.project_sidebar.model
+            model.setRootPath(proj)
+            self.project_sidebar.tree.setRootIndex(model.index(proj))
+
+        # open each file
+        for path in tabs:
+            # ignore if missing
+            if os.path.isfile(path):
+                self.editor_area.new_tab(path)
+
+        # restore window size and position if available
+        if win_size and isinstance(win_size, list) and len(win_size) == 2:
+            self.resize(win_size[0], win_size[1])
+        if win_pos and isinstance(win_pos, list) and len(win_pos) == 2:
+            self.move(win_pos[0], win_pos[1])
+
+    def save_state(self):
+        """Save current project folder + list of open tabs + window size."""
+        tabs = []
+        # primary
+        for i in range(self.editor_area.tabs.count()):
+            ed = self.editor_area.tabs.widget(i)
+            p = getattr(ed, "file_path", None)
+            if p:
+                tabs.append(p)
+        # secondary (if split exists)
+        st = self.editor_area.secondary_tabs
+        if st:
+            for i in range(st.count()):
+                ed = st.widget(i)
+                p = getattr(ed, "file_path", None)
+                if p:
+                    tabs.append(p)
+
+        state = {
+            "project_dir": self.project_dir,
+            "open_tabs": tabs,
+            "window_size": [self.size().width(), self.size().height()],
+            "window_pos": [self.pos().x(), self.pos().y()]
+        }
+        try:
+            with open(self.state_path, 'w', encoding='utf-8') as f:
+                json.dump(state, f, indent=2)
+        except Exception as e:
+            print(f"⚠️  Could not save state: {e}")
+
+
     # ────── helper to show welcome if no tabs ─────────────────────────────
     def _check_tabs(self):
         if self.editor_area.tabs.count() == 0:
@@ -953,6 +1032,15 @@ class MainWindow(QMainWindow):
 
     # ─── Slot: Open a new project directory ────────────────────────────────
     def open_folder(self):
+        # ── Clear existing open tabs ─────────────────
+        # primary tabs
+        self.editor_area.tabs.clear()
+        # secondary split (if exists)
+        if self.editor_area.secondary_tabs:
+            self.splitter.widget(1).deleteLater()
+            self.editor_area.secondary_tabs = None
+        # reset welcome screen if desired
+        self._check_tabs()
         folder = QFileDialog.getExistingDirectory(
             self,
             "Open Project Folder",
@@ -993,9 +1081,13 @@ class MainWindow(QMainWindow):
                 print(f"⚠️  Failed to autosave '{fn}': {e}")
     
     def save_file(self):
-        ed = self.editor_area.current_editor()
-        if ed is None:
-            return
+        # 1) Figure out which widget is active, and extract the CodeEditor if needed
+        current = self.editor_area.current_editor()
+        # if we’re in an HTML/MD split, pull out the inner editor
+        if hasattr(current, "editor") and isinstance(current.editor, QPlainTextEdit):
+            ed = current.editor
+        else:
+            ed = current  # normal CodeEditor
 
         path = getattr(ed, "file_path", None)
         if not path:
@@ -1008,7 +1100,7 @@ class MainWindow(QMainWindow):
             idx = self.editor_area.tabs.currentIndex()
             self.editor_area.tabs.setTabText(idx, os.path.basename(path))
 
-        # --- write out the current editor ---
+        # 2) Now safe to open/write
         try:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(ed.toPlainText())
@@ -1016,52 +1108,95 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Save Error", f"Could not save file:\n{e}")
             return
 
-        # clear modified flag on this editor
+        # 3) Clear modified flag on this editor
         ed.document().setModified(False)
 
-        # --- now reload any *other* tabs editing the same file ---
-        def reload_editor(other_ed):
+        # 4) Reload any other open tabs on the same path
+        def reload_ed(other):
             try:
                 with open(path, 'r', encoding='utf-8') as f:
                     content = f.read()
-            except Exception:
+            except:
                 return
-            # remember cursor position
-            tc = other_ed.textCursor()
+            tc = other.textCursor()
             pos = tc.position()
-            # temporarily block signals so we don't trigger bracket‐match, modified‐flags, etc.
-            other_ed.blockSignals(True)
-            other_ed.setPlainText(content)
-            other_ed.blockSignals(False)
-            other_ed.document().setModified(False)
-            # restore cursor (clamped to content length)
-            pos = min(pos, len(content))
-            tc.setPosition(pos)
-            other_ed.setTextCursor(tc)
+            other.blockSignals(True)
+            other.setPlainText(content)
+            other.blockSignals(False)
+            other.document().setModified(False)
+            tc.setPosition(min(pos, len(content)))
+            other.setTextCursor(tc)
 
-        # update across both primary and split tabs
         # primary tabs
         for i in range(self.editor_area.tabs.count()):
-            other = self.editor_area.tabs.widget(i)
-            if getattr(other, 'file_path', None) == path and other is not ed:
-                reload_editor(other)
-        # secondary tabs (if you have a split pane)
+            w = self.editor_area.tabs.widget(i)
+            # get its editor if it’s a splitter, else w itself
+            target = w.editor if hasattr(w, "editor") else w
+            if getattr(target, "file_path", None) == path and target is not ed:
+                reload_ed(target)
+
+        # secondary (split) tabs
         st = self.editor_area.secondary_tabs
         if st:
             for i in range(st.count()):
-                other = st.widget(i)
-                if getattr(other, 'file_path', None) == path and other is not ed:
-                    reload_editor(other)
+                w = st.widget(i)
+                target = w.editor if hasattr(w, "editor") else w
+                if getattr(target, "file_path", None) == path and target is not ed:
+                    reload_ed(target)
+
+        # 5) Update any live-preview panes
+        from PyQt6.QtCore import QUrl
+        import markdown
+        def refresh_container(w):
+            if getattr(w, "file_path", None) != path:
+                return
+            # HTML
+            if hasattr(w, "webview") and hasattr(w, "editor"):
+                base = QUrl.fromLocalFile(path)
+                w.webview.setHtml(w.editor.toPlainText(), base)
+            # Markdown
+            elif hasattr(w, "preview") and hasattr(w, "editor"):
+                w.preview.setHtml(markdown.markdown(w.editor.toPlainText()))
+
+        for i in range(self.editor_area.tabs.count()):
+            refresh_container(self.editor_area.tabs.widget(i))
+        if st:
+            for i in range(st.count()):
+                refresh_container(st.widget(i))
+
 
 
     def closeEvent(self, ev):
-        # on close, prompt to recover if no real tabs open
+        # Save state before closing
+        self.save_state()
         super().closeEvent(ev)
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+
+    # Create custom dark palette
+    palette = QPalette()
+    palette.setColor(QPalette.ColorRole.Window, QColor(53, 53, 53))
+    palette.setColor(QPalette.ColorRole.WindowText, Qt.GlobalColor.white)
+    palette.setColor(QPalette.ColorRole.Base, QColor(35, 35, 35))
+    palette.setColor(QPalette.ColorRole.AlternateBase, QColor(53, 53, 53))
+    palette.setColor(QPalette.ColorRole.ToolTipBase, Qt.GlobalColor.white)
+    palette.setColor(QPalette.ColorRole.ToolTipText, Qt.GlobalColor.white)
+    palette.setColor(QPalette.ColorRole.Text, Qt.GlobalColor.white)
+    palette.setColor(QPalette.ColorRole.Button, QColor(53, 53, 53))
+    palette.setColor(QPalette.ColorRole.ButtonText, Qt.GlobalColor.white)
+    palette.setColor(QPalette.ColorRole.BrightText, Qt.GlobalColor.red)
+    palette.setColor(QPalette.ColorRole.Link, QColor(42, 130, 218))
+    palette.setColor(QPalette.ColorRole.Highlight, QColor(42, 130, 218))
+    palette.setColor(QPalette.ColorRole.HighlightedText, Qt.GlobalColor.black)
+
+    app.setPalette(palette)
+
+    # Main window setup
     w = MainWindow()
     w.resize(1200, 800)
     w.show()
+
     sys.exit(app.exec())
