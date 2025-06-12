@@ -1,16 +1,17 @@
 # main.py
 import sys, os, json, subprocess, tempfile, traceback, shutil
 import markdown
-
-from PyQt6.QtGui import QColor, QFont, QPalette, QTextCharFormat, QTextCursor, QTextDocument, QFileSystemModel, QAction, QIcon
+from PIL import Image
+from PIL.ImageQt import ImageQt
+from PyQt6.QtGui import QColor, QFont, QPalette, QTextCharFormat, QTextCursor, QTextDocument, QFileSystemModel, QAction, QIcon, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QSplitter, QTabWidget, QPlainTextEdit,
     QTreeView, QDockWidget, QLineEdit, QPushButton, QListWidget,
     QTextEdit, QLabel, QVBoxLayout, QHBoxLayout, QMessageBox,
     QFileDialog, QInputDialog, QMenu, QAbstractItemView, QStackedWidget
 )
-from PyQt6.QtCore import Qt, QTimer, QPoint
-
+from PyQt6.QtCore import Qt, QTimer, QPoint, QSize, QRect
+from PyQt6.QtWebEngineWidgets import QWebEngineView
 
 # ────── Utility: Theme Manager ────────────────────────────────────────────────
 def load_theme(path):
@@ -60,10 +61,22 @@ def load_plugins(main_win):
                 traceback.print_exc()
     return plugins
 
+class LineNumberArea(QWidget):
+    def __init__(self, editor):
+        super().__init__(editor)
+        self.code_editor = editor
+
+    def sizeHint(self):
+        return QSize(self.code_editor.lineNumberAreaWidth(), 0)
+
+    def paintEvent(self, event):
+        self.code_editor.lineNumberAreaPaintEvent(event)
+
 # ────── Code Editor with line numbers, bracket match & minimap stub ─────────
 class CodeEditor(QPlainTextEdit):
     def __init__(self):
         super().__init__()
+        self.lineNumberArea = LineNumberArea(self)  # ✅ Moved this line to the top
         self.setFont(QFont("Fira Code", 12))
         self.cursorPositionChanged.connect(self.match_brackets)
         # Simplified minimap placeholder: will just draw a grey bar
@@ -71,10 +84,53 @@ class CodeEditor(QPlainTextEdit):
         self.minimap.setFixedWidth(80)
         self.minimap.setStyleSheet("background-color: rgba(200,200,200,0.1);")
         self.update_viewport_margins()
+
+    def lineNumberAreaWidth(self):
+        # enough space for the number of digits in the block count
+        digits = len(str(max(1, self.blockCount())))
+        # padding: 3px + digit_width*d + extra
+        space = self.fontMetrics().horizontalAdvance("9") * digits + 12
+        return space
+
+    def updateLineNumberAreaWidth(self, _):
+        self.setViewportMargins(self.lineNumberAreaWidth(), 0, 0, 0)
+
+    def updateLineNumberArea(self, rect, dy):
+        if dy:
+            self.lineNumberArea.scroll(0, dy)
+        else:
+            self.lineNumberArea.update(0, rect.y(), self.lineNumberArea.width(), rect.height())
+        if rect.contains(self.viewport().rect()):
+            self.updateLineNumberAreaWidth(0)
+
     def resizeEvent(self, ev):
         super().resizeEvent(ev)
-        h = self.viewport().height()
-        self.minimap.setGeometry(self.viewport().width()-80, 0, 80, h)
+        cr = self.contentsRect()
+        self.lineNumberArea.setGeometry(
+            QRect(cr.left(), cr.top(), self.lineNumberAreaWidth(), cr.height())
+        )
+
+    def lineNumberAreaPaintEvent(self, event):
+        painter = QPainter(self.lineNumberArea)
+        painter.fillRect(event.rect(), QColor("#2e3440"))   # dark gutter
+        block = self.firstVisibleBlock()
+        block_number = block.blockNumber()
+        top = int(self.blockBoundingGeometry(block).translated(self.contentOffset()).top())
+        bottom = top + int(self.blockBoundingRect(block).height())
+
+        while block.isValid() and top <= event.rect().bottom():
+            if block.isVisible() and bottom >= event.rect().top():
+                number = str(block_number + 1)
+                painter.setPen(QColor("#4c566a"))
+                x = self.lineNumberArea.width() - self.fontMetrics().horizontalAdvance(number) - 6
+                painter.drawText(x, top, self.fontMetrics().horizontalAdvance(number), self.fontMetrics().height(),
+                                 Qt.AlignmentFlag.AlignRight, number)
+            block = block.next()
+            top = bottom
+            bottom = top + int(self.blockBoundingRect(block).height())
+            block_number += 1
+        painter.end()
+
     def update_viewport_margins(self):
         self.setViewportMargins(0,0,80,0)
     def match_brackets(self):
@@ -123,21 +179,42 @@ class EditorArea(QWidget):
         self.tabs = QTabWidget()
         self.tabs.setTabsClosable(True)
         self.tabs.tabCloseRequested.connect(self.close_tab)
+
+        # secondary tabs for the split pane (created on first split)
+        self.secondary_tabs = None
+        
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
         self.splitter.addWidget(self.tabs)
         lay = QVBoxLayout(self)
         lay.addWidget(self.splitter)
 
     def new_tab(self, path=None):
+        if path:
+            ext = os.path.splitext(path)[1].lower()
+            
+            # Handle images
+            if ext in ['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico']:
+                return self._open_image_tab(path)
+                
+            # Handle HTML
+            elif ext in ['.html', '.htm']:
+                return self._open_html_tab(path)
+                
+            # Handle Markdown
+            elif ext == '.md':
+                return self._open_markdown_tab(path)
+        
+        # Default to text editor
+        return self._open_text_tab(path)
+
+    def _open_text_tab(self, path):
         ed = CodeEditor()
         ed.file_path = path
-        # connect modification tracking
         ed.document().modificationChanged.connect(
             lambda modified, ed=ed: self._mark_unsaved(ed, modified)
         )
 
         if path:
-            # your existing load logic (UTF-8 / fallback)
             try:
                 with open(path, 'r', encoding='utf-8') as f:
                     content = f.read()
@@ -145,12 +222,111 @@ class EditorArea(QWidget):
                 with open(path, 'r', encoding='latin-1', errors='replace') as f:
                     content = f.read()
             ed.setPlainText(content)
+        
         idx = self.tabs.addTab(ed, os.path.basename(path) if path else "Untitled")
         self.tabs.setCurrentIndex(idx)
-
-        # clear the “modified” flag after loading
         ed.document().setModified(False)
         return ed
+
+    def _open_image_tab(self, path):
+        try:
+            # Load image using PIL to handle all formats including .ico
+            img = Image.open(path)
+            qimg = ImageQt(img).copy()
+            pixmap = QPixmap.fromImage(qimg)
+            
+            # Create display widget
+            container = QWidget()
+            layout = QVBoxLayout(container)
+            label = QLabel()
+            label.setPixmap(pixmap)
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            layout.addWidget(label)
+            
+            # Add to tab
+            idx = self.tabs.addTab(container, os.path.basename(path))
+            self.tabs.setCurrentIndex(idx)
+            return container
+        except Exception as e:
+            QMessageBox.warning(self, "Image Error", f"Could not open image: {e}")
+            return self._open_text_tab(path)
+
+    def _open_html_tab(self, path):
+        # Create split view
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        
+        # Left: Code editor
+        editor = CodeEditor()
+        editor.file_path = path
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                content = f.read()
+        except:
+            with open(path, 'r', encoding='latin-1', errors='replace') as f:
+                content = f.read()
+        editor.setPlainText(content)
+        editor.document().setModified(False)
+        
+        # Right: Web view preview
+        webview = QWebEngineView()
+        webview.setHtml(content)
+        
+        # Connect editor to update preview
+        editor.textChanged.connect(lambda: webview.setHtml(editor.toPlainText()))
+        
+        splitter.addWidget(editor)
+        splitter.addWidget(webview)
+        splitter.setSizes([300, 300])
+        
+        idx = self.tabs.addTab(splitter, os.path.basename(path))
+        self.tabs.setCurrentIndex(idx)
+        return splitter
+
+    def _open_markdown_tab(self, path):
+        # Create split view
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        
+        # Left: Code editor
+        editor = CodeEditor()
+        editor.file_path = path
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                content = f.read()
+        except:
+            with open(path, 'r', encoding='latin-1', errors='replace') as f:
+                content = f.read()
+        editor.setPlainText(content)
+        editor.document().setModified(False)
+        
+        # Right: Markdown preview
+        preview = QTextEdit()
+        preview.setReadOnly(True)
+        
+        # Convert and display
+        html = markdown.markdown(content)
+        preview.setHtml(html)
+        
+        # Connect editor to update preview
+        editor.textChanged.connect(lambda: self.update_markdown_preview(editor, preview))
+        
+        # Add sync scrolling
+        sb_ed = editor.verticalScrollBar()
+        sb_md = preview.verticalScrollBar()
+        sb_ed.valueChanged.connect(sb_md.setValue)
+        sb_md.valueChanged.connect(sb_ed.setValue)
+        
+        splitter.addWidget(editor)
+        splitter.addWidget(preview)
+        splitter.setSizes([300, 300])
+        
+        idx = self.tabs.addTab(splitter, os.path.basename(path))
+        self.tabs.setCurrentIndex(idx)
+        return splitter
+
+    def update_markdown_preview(self, editor, preview):
+        source_md = editor.toPlainText()
+        html = markdown.markdown(source_md)
+        preview.setHtml(html)
 
     def _mark_unsaved(self, ed, modified):
         """Add or remove the white-dot indicator in the tab text."""
@@ -167,7 +343,35 @@ class EditorArea(QWidget):
                 self.tabs.setTabText(idx, text[:-len(dot)])
 
     def close_tab(self, i):
-        self.tabs.removeTab(i)
+        # if we’re closing in the secondary pane
+        if self.secondary_tabs and self.secondary_tabs.widget(i):
+            self.secondary_tabs.removeTab(i)
+            # if secondary is now empty, remove it
+            if self.secondary_tabs.count() == 0:
+                self.splitter.widget(1).deleteLater()
+                self.secondary_tabs = None
+        else:
+            self.tabs.removeTab(i)
+
+    def split_current(self):
+        ed = self.current_editor()
+        if not ed:
+            return
+        # first-time: create the secondary QTabWidget
+        if not self.secondary_tabs:
+            self.secondary_tabs = QTabWidget()
+            self.secondary_tabs.setTabsClosable(True)
+            self.secondary_tabs.tabCloseRequested.connect(self.close_tab)
+            self.splitter.addWidget(self.secondary_tabs)
+
+        # clone the editor into the split pane
+        ed2 = CodeEditor()
+        ed2.file_path = ed.file_path
+        ed2.setPlainText(ed.toPlainText())
+        ed2.document().setModified(ed.document().isModified())
+        # copy your signals if you need them (bracket‐match, etc.)
+        idx = self.secondary_tabs.addTab(ed2, self.tabs.tabText(self.tabs.currentIndex()))
+        self.secondary_tabs.setCurrentIndex(idx)
 
     def current_editor(self):
         return self.tabs.currentWidget()
@@ -429,27 +633,6 @@ class GitDock(QDockWidget):
         dlg.setText(diff or "(no diff)")
         dlg.exec()
 
-# ────── Markdown Preview Dock ───────────────────────────────────────────────
-class MarkdownDock(QDockWidget):
-    def __init__(self, parent):
-        super().__init__("Markdown Preview", parent)
-        self.viewer = QTextEdit()
-        self.viewer.setReadOnly(True)
-        self.setWidget(self.viewer)
-
-    def set_editor(self, editor):
-        # two-way scroll sync
-        sb_ed = editor.verticalScrollBar()
-        sb_md = self.viewer.verticalScrollBar()
-        sb_ed.valueChanged.connect(sb_md.setValue)
-        sb_md.valueChanged.connect(sb_ed.setValue)
-        # update on text change
-        editor.textChanged.connect(lambda: self.update(editor.toPlainText()))
-
-    def update(self, source_md: str):
-        html = markdown.markdown(source_md)
-        self.viewer.setHtml(html)
-
 # ────── Terminal Pane ───────────────────────────────────────────────────────
 class TerminalDock(QDockWidget):
     def __init__(self, parent):
@@ -525,7 +708,7 @@ class MainWindow(QMainWindow):
         self.central_stack.setCurrentIndex(0)  # start on welcome
         # docks
         # ─── Project sidebar uses self.project_dir ────────────────────────────
-        # ─── docks (project, find, git, md, term) ─────────────────────────
+        # ─── docks (project, find, git, term) ─────────────────────────
         self.project_sidebar = ProjectSidebar(self.project_dir)
         proj_dock = QDockWidget("Project", self)
         proj_dock.setWidget(self.project_sidebar)
@@ -536,9 +719,6 @@ class MainWindow(QMainWindow):
 
         self.git_dock  = GitDock(self, self.project_dir)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.git_dock)
-
-        self.md_dock   = MarkdownDock(self)
-        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.md_dock)
 
         self.term_dock = TerminalDock(self)
         self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.term_dock)
@@ -563,6 +743,12 @@ class MainWindow(QMainWindow):
         open_folder_act.setShortcut("Ctrl+K")
         open_folder_act.triggered.connect(self.open_folder)
         file_menu.addAction(open_folder_act)
+
+        view_menu = self.menuBar().addMenu("&View")
+        split_act = QAction("Split &Editor", self)
+        split_act.setShortcut("Ctrl+\\")
+        split_act.triggered.connect(self.editor_area.split_current)
+        view_menu.addAction(split_act)
 
     # ────── helper to show welcome if no tabs ─────────────────────────────
     def _check_tabs(self):
@@ -639,28 +825,6 @@ class MainWindow(QMainWindow):
     def closeEvent(self, ev):
         # on close, prompt to recover if no real tabs open
         super().closeEvent(ev)
-
-    def on_tab_changed(self, idx):
-        ed = self.editor_area.current_editor()
-        # we store the file path on the editor widget when opening:
-        path = getattr(ed, "file_path", None)
-        if path and path.lower().endswith(".md"):
-            # load fresh text (in case external edits)
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    txt = f.read()
-            except:
-                txt = ed.toPlainText()
-            ed.blockSignals(True)
-            ed.setPlainText(txt)
-            ed.blockSignals(False)
-
-            # update and sync
-            self.md_dock.update(txt)
-            self.md_dock.set_editor(ed)
-        else:
-            # clear preview & disconnect old signals
-            self.md_dock.viewer.clear()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
