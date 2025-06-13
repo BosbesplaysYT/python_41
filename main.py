@@ -480,88 +480,197 @@ class LineNumberArea(QWidget):
         self.code_editor.lineNumberAreaPaintEvent(event)
 
 class SyntaxRule:
-    def __init__(self, pattern, color, font_weight=None, italic=False):
-        self.pattern = re.compile(pattern)
+    def __init__(self, pattern, color, font_weight=None, italic=False, 
+                 multiline_start=None, multiline_end=None, case_sensitive=True):
+        flags = 0 if case_sensitive else re.IGNORECASE
+        self.pattern = re.compile(pattern, flags)
         self.format = QTextCharFormat()
         self.format.setForeground(QColor(color))
         if font_weight:
             self.format.setFontWeight(font_weight)
         if italic:
             self.format.setFontItalic(True)
+        # For multi-line constructs, define start/end regex strings (compiled later)
+        self.multiline_start = re.compile(multiline_start, flags) if multiline_start else None
+        self.multiline_end = re.compile(multiline_end, flags) if multiline_end else None
+
 
 class CustomHighlighter(QSyntaxHighlighter):
     def __init__(self, document, rules, mode_switcher=None):
         super().__init__(document)
         self.rules = rules
-        self.mode_switcher = mode_switcher  # Optional callable to switch rules dynamically
+        self.mode_switcher = mode_switcher
+        # Track multi-line states for each block separately by rule index
+        self.current_multiline_state = {}
 
     def highlightBlock(self, text):
+        block_num = self.currentBlock().blockNumber()
         if self.mode_switcher:
-            active_rules = self.mode_switcher(self.currentBlock().blockNumber(), text)
+            active_rules = self.mode_switcher(block_num, text)
         else:
             active_rules = self.rules
 
+        # Reset formats
+        self.setCurrentBlockState(0)
+
+        # Handle multi-line rules first (e.g. multi-line comments, multi-line strings)
+        for i, rule in enumerate(active_rules):
+            if rule.multiline_start and rule.multiline_end:
+                self.highlight_multiline(text, rule, i)
+
+        # Highlight single-line rules (skip multi-line patterns here)
         for rule in active_rules:
+            if rule.multiline_start and rule.multiline_end:
+                continue
             for match in rule.pattern.finditer(text):
                 start, end = match.span()
                 self.setFormat(start, end - start, rule.format)
 
-def php_html_mode_switcher_factory(document):
-    php_blocks = {}
+    def highlight_multiline(self, text, rule, rule_index):
+        start_pattern = rule.multiline_start
+        end_pattern = rule.multiline_end
 
-    # Pre-scan the entire document to mark which blocks are PHP
+        # Retrieve previous block state for this rule, if any
+        state = self.current_multiline_state.get(rule_index, 0)
+
+        start_idx = 0
+        if state == 0:
+            match_start = start_pattern.search(text)
+            if not match_start:
+                return  # no start found, no multi-line in this block
+            start_idx = match_start.start()
+            match_end = end_pattern.search(text, start_idx)
+            if match_end:
+                # Multi-line starts and ends on same line
+                end_idx = match_end.end()
+                self.setFormat(start_idx, end_idx - start_idx, rule.format)
+                self.current_multiline_state[rule_index] = 0
+                return
+            else:
+                # Multi-line starts here and continues beyond
+                self.setFormat(start_idx, len(text) - start_idx, rule.format)
+                self.current_multiline_state[rule_index] = 1
+                self.setCurrentBlockState(1 + rule_index)  # custom state
+        else:
+            # We are continuing a multi-line from previous block
+            match_end = end_pattern.search(text)
+            if match_end:
+                end_idx = match_end.end()
+                self.setFormat(0, end_idx, rule.format)
+                self.current_multiline_state[rule_index] = 0
+                self.setCurrentBlockState(0)
+            else:
+                # Entire block is inside multi-line
+                self.setFormat(0, len(text), rule.format)
+                self.current_multiline_state[rule_index] = 1
+                self.setCurrentBlockState(1 + rule_index)
+
+
+def php_html_mode_switcher_factory(document):
+    # Improved mode switcher supporting PHP inside HTML and
+    # handling multi-line PHP tags and embedded scripts/styles
+
+    # We'll scan once and cache block modes for speed
+    block_modes = {}
+
+    # States: 'html', 'php', 'js', 'css'
+    mode = 'html'
+
     block = document.firstBlock()
-    in_php = False
     while block.isValid():
         text = block.text()
-        if re.search(r"<\?(php|=)?", text):
-            in_php = True
-        if re.search(r"\?>", text):
-            in_php = False
-        php_blocks[block.blockNumber()] = in_php
+        # Check for PHP start/end tags
+        if mode == 'html' and re.search(r"<\?(php|=)?", text, re.IGNORECASE):
+            mode = 'php'
+        elif mode == 'php' and re.search(r"\?>", text):
+            mode = 'html'
+        # Check for <script> and </script> tags (basic)
+        elif mode == 'html' and re.search(r"<script\b[^>]*>", text, re.IGNORECASE):
+            mode = 'js'
+        elif mode == 'js' and re.search(r"</script>", text, re.IGNORECASE):
+            mode = 'html'
+        # Check for <style> and </style> tags (basic)
+        elif mode == 'html' and re.search(r"<style\b[^>]*>", text, re.IGNORECASE):
+            mode = 'css'
+        elif mode == 'css' and re.search(r"</style>", text, re.IGNORECASE):
+            mode = 'html'
+
+        block_modes[block.blockNumber()] = mode
         block = block.next()
 
     def switcher(block_number, text):
-        if php_blocks.get(block_number, False):
+        mode = block_modes.get(block_number, 'html')
+        if mode == 'php':
             return SYNTAX_RULES['php-embedded']['php']
+        elif mode == 'js':
+            return SYNTAX_RULES['php-embedded']['js']
+        elif mode == 'css':
+            return SYNTAX_RULES['php-embedded']['css']
         else:
             return SYNTAX_RULES['php-embedded']['html']
 
     return switcher
 
 
+# Updated and extended SYNTAX_RULES with multiline and new languages support
 SYNTAX_RULES = {
     'python': [
-        SyntaxRule(r'\b(def|class|return|if|else|elif|import|from|as|while|for|try|except|finally|with|pass|yield|lambda|in|not|or|and|is|global|nonlocal|assert|del|raise|True|False|None)\b', '#569CD6', font_weight=QFont.Weight.Bold),
-        SyntaxRule(r'".*?"|\'.*?\'', '#CE9178'),  # Strings
-        SyntaxRule(r'#.*', '#6A9955', italic=True),  # Comments
-        SyntaxRule(r'\b[0-9]+\b', '#B5CEA8'),  # Numbers
-        SyntaxRule(r'[=+\-*/%<>!&|^~]', '#D4D4D4'),  # Operators
+        SyntaxRule(
+            r'\b(def|class|return|if|else|elif|import|from|as|while|for|try|except|finally|with|pass|yield|lambda|in|not|or|and|is|global|nonlocal|assert|del|raise|True|False|None)\b',
+            '#569CD6', font_weight=QFont.Weight.Bold),
+        SyntaxRule(r'(""".*?"""|\'\'\'.*?\'\'\'|".*?(?<!\\)"|\'.*?(?<!\\)\')', '#CE9178', multiline_start=r'("""|\'\'\')', multiline_end=r'("""|\'\'\')'),
+        SyntaxRule(r'#.*', '#6A9955', italic=True),
+        SyntaxRule(r'\b[0-9]+\b', '#B5CEA8'),
+        SyntaxRule(r'[=+\-*/%<>!&|^~]', '#D4D4D4'),
     ],
     'html': [
-        SyntaxRule(r'</?[a-zA-Z0-9]+(?=\s|>)', '#569CD6', font_weight=QFont.Weight.Bold),  # Tag name
-        SyntaxRule(r'\b[a-zA-Z-]+(?==")', '#9CDCFE'),  # Attribute name
-        SyntaxRule(r'"[^"]*"', '#CE9178'),  # Attribute values
-        SyntaxRule(r'<!--.*?-->', '#6A9955', italic=True),  # Comments
+        SyntaxRule(r'<!--.*?-->', '#6A9955', italic=True, multiline_start=r'<!--', multiline_end=r'-->'),  # Comments multiline
+        SyntaxRule(r'</?[a-zA-Z0-9]+', '#569CD6', font_weight=QFont.Weight.Bold),
+        SyntaxRule(r'\b[a-zA-Z-]+(?==")', '#9CDCFE'),
+        SyntaxRule(r'"[^"]*"', '#CE9178'),
     ],
     'php': [
-        SyntaxRule(r'<\?php|\?>', '#D4D4D4', font_weight=QFont.Weight.Bold),
-        SyntaxRule(r'\b(function|class|echo|if|else|elseif|while|for|foreach|switch|case|default|return|break|continue|true|false|null)\b', '#569CD6', font_weight=QFont.Weight.Bold),
-        SyntaxRule(r'\$[a-zA-Z_][a-zA-Z0-9_]*', '#9CDCFE'),  # Variables
-        SyntaxRule(r'".*?"|\'.*?\'', '#CE9178'),  # Strings
-        SyntaxRule(r'//.*?$|/\*.*?\*/', '#6A9955', italic=True),  # Comments
+        SyntaxRule(r'<\?php|\?>', '#D4D4D4', font_weight=QFont.Weight.Bold, case_sensitive=False),
+        SyntaxRule(
+            r'\b(function|class|echo|if|else|elseif|while|for|foreach|switch|case|default|return|break|continue|true|false|null|public|private|protected|static|var|const|extends|implements|interface|abstract|final|try|catch|finally|throw|new|use|namespace|global|isset|empty|array|print|require|require_once|include|include_once|die|exit)\b',
+            '#569CD6', font_weight=QFont.Weight.Bold, case_sensitive=False),
+        SyntaxRule(r'\$[a-zA-Z_][a-zA-Z0-9_]*', '#9CDCFE'),
+        SyntaxRule(r'(""".*?"""|\'\'\'.*?\'\'\'|".*?(?<!\\)"|\'.*?(?<!\\)\')', '#CE9178', multiline_start=r'"""|\'\'\'', multiline_end=r'"""|\'\'\''),
+        SyntaxRule(r'//.*?$|/\*.*?\*/|#.*', '#6A9955', italic=True, multiline_start=r'/\*', multiline_end=r'\*/'),
         SyntaxRule(r'\b[0-9]+\b', '#B5CEA8'),
+        SyntaxRule(r'[=+\-*/%<>!&|^~.,;:()\[\]{}]', '#D4D4D4'),
     ],
     'css': [
-        SyntaxRule(r'\.[\w\-]+', '#D7BA7D'),  # Class selectors
-        SyntaxRule(r'#[\w\-]+', '#C586C0'),  # ID selectors
-        SyntaxRule(r'\b[a-z\-]+\s*:', '#9CDCFE'),  # Property names
-        SyntaxRule(r':[a-z\-]+', '#DCDCAA'),  # Pseudo-selectors
-        SyntaxRule(r'{|}', '#D4D4D4'),  # Braces
-        SyntaxRule(r'"[^"]*"|\'[^\']*\'', '#CE9178'),  # Strings
-        SyntaxRule(r'/\*.*?\*/', '#6A9955', italic=True),  # Comments
-    ]
+        SyntaxRule(r'\.[\w\-]+', '#D7BA7D'),
+        SyntaxRule(r'#[\w\-]+', '#C586C0'),
+        SyntaxRule(r'\b[a-z\-]+\s*:', '#9CDCFE'),
+        SyntaxRule(r':[a-z\-]+', '#DCDCAA'),
+        SyntaxRule(r'{|}', '#D4D4D4'),
+        SyntaxRule(r'"[^"]*"|\'[^\']*\'', '#CE9178'),
+        SyntaxRule(r'/\*.*?\*/', '#6A9955', italic=True, multiline_start=r'/\*', multiline_end=r'\*/'),
+    ],
+    'js': [
+        SyntaxRule(r'\b(function|var|let|const|if|else|for|while|do|switch|case|break|continue|return|try|catch|finally|throw|new|this|typeof|instanceof|in|of|true|false|null|undefined)\b', '#569CD6', font_weight=QFont.Weight.Bold),
+        SyntaxRule(r'//.*$', '#6A9955', italic=True),
+        SyntaxRule(r'/\*.*?\*/', '#6A9955', italic=True, multiline_start=r'/\*', multiline_end=r'\*/'),
+        SyntaxRule(r'"[^"\\]*(\\.[^"\\]*)*"', '#CE9178'),
+        SyntaxRule(r"'[^'\\]*(\\.[^'\\]*)*'", '#CE9178'),
+        SyntaxRule(r'\b[0-9]+\b', '#B5CEA8'),
+        SyntaxRule(r'[=+\-*/%<>!&|^~.,;:()\[\]{}]', '#D4D4D4'),
+    ],
+    'php-embedded': {
+        'php': [],  # will be populated below (same as 'php')
+        'html': [],  # same as 'html'
+        'css': [],   # same as 'css'
+        'js': [],    # same as 'js'
+    }
 }
+
+# Populate embedded sets to avoid repetition
+SYNTAX_RULES['php-embedded']['php'] = SYNTAX_RULES['php']
+SYNTAX_RULES['php-embedded']['html'] = SYNTAX_RULES['html']
+SYNTAX_RULES['php-embedded']['css'] = SYNTAX_RULES['css']
+SYNTAX_RULES['php-embedded']['js'] = SYNTAX_RULES['js']
 
 
 # ────── Code Editor with line numbers, bracket match & minimap stub ─────────
