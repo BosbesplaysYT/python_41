@@ -3,7 +3,7 @@ import sys, os, json, subprocess, re, traceback, shutil
 import markdown
 from PIL import Image
 from PIL.ImageQt import ImageQt
-from PyQt6.QtGui import QColor, QFont, QPalette, QTextCharFormat, QTextCursor, QTextDocument, QFileSystemModel, QAction, QIcon, QPainter, QPixmap, QShortcut, QKeySequence
+from PyQt6.QtGui import QColor, QFont, QPalette, QTextCharFormat, QTextCursor, QSyntaxHighlighter, QFileSystemModel, QAction, QIcon, QPainter, QPixmap, QShortcut, QKeySequence
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QSplitter, QTabWidget, QPlainTextEdit,
     QTreeView, QDockWidget, QLineEdit, QPushButton, QListWidget,
@@ -479,6 +479,91 @@ class LineNumberArea(QWidget):
     def paintEvent(self, event):
         self.code_editor.lineNumberAreaPaintEvent(event)
 
+class SyntaxRule:
+    def __init__(self, pattern, color, font_weight=None, italic=False):
+        self.pattern = re.compile(pattern)
+        self.format = QTextCharFormat()
+        self.format.setForeground(QColor(color))
+        if font_weight:
+            self.format.setFontWeight(font_weight)
+        if italic:
+            self.format.setFontItalic(True)
+
+class CustomHighlighter(QSyntaxHighlighter):
+    def __init__(self, document, rules, mode_switcher=None):
+        super().__init__(document)
+        self.rules = rules
+        self.mode_switcher = mode_switcher  # Optional callable to switch rules dynamically
+
+    def highlightBlock(self, text):
+        if self.mode_switcher:
+            active_rules = self.mode_switcher(self.currentBlock().blockNumber(), text)
+        else:
+            active_rules = self.rules
+
+        for rule in active_rules:
+            for match in rule.pattern.finditer(text):
+                start, end = match.span()
+                self.setFormat(start, end - start, rule.format)
+
+def php_html_mode_switcher_factory(document):
+    php_blocks = {}
+
+    # Pre-scan the entire document to mark which blocks are PHP
+    block = document.firstBlock()
+    in_php = False
+    while block.isValid():
+        text = block.text()
+        if re.search(r"<\?(php|=)?", text):
+            in_php = True
+        if re.search(r"\?>", text):
+            in_php = False
+        php_blocks[block.blockNumber()] = in_php
+        block = block.next()
+
+    def switcher(block_number, text):
+        if php_blocks.get(block_number, False):
+            return SYNTAX_RULES['php-embedded']['php']
+        else:
+            return SYNTAX_RULES['php-embedded']['html']
+
+    return switcher
+
+
+SYNTAX_RULES = {
+    'python': [
+        SyntaxRule(r'\b(def|class|return|if|else|elif|import|from|as|while|for|try|except|finally|with|pass|yield|lambda|in|not|or|and|is|global|nonlocal|assert|del|raise|True|False|None)\b', '#569CD6', font_weight=QFont.Weight.Bold),
+        SyntaxRule(r'".*?"|\'.*?\'', '#CE9178'),  # Strings
+        SyntaxRule(r'#.*', '#6A9955', italic=True),  # Comments
+        SyntaxRule(r'\b[0-9]+\b', '#B5CEA8'),  # Numbers
+        SyntaxRule(r'[=+\-*/%<>!&|^~]', '#D4D4D4'),  # Operators
+    ],
+    'html': [
+        SyntaxRule(r'</?[a-zA-Z0-9]+(?=\s|>)', '#569CD6', font_weight=QFont.Weight.Bold),  # Tag name
+        SyntaxRule(r'\b[a-zA-Z-]+(?==")', '#9CDCFE'),  # Attribute name
+        SyntaxRule(r'"[^"]*"', '#CE9178'),  # Attribute values
+        SyntaxRule(r'<!--.*?-->', '#6A9955', italic=True),  # Comments
+    ],
+    'php': [
+        SyntaxRule(r'<\?php|\?>', '#D4D4D4', font_weight=QFont.Weight.Bold),
+        SyntaxRule(r'\b(function|class|echo|if|else|elseif|while|for|foreach|switch|case|default|return|break|continue|true|false|null)\b', '#569CD6', font_weight=QFont.Weight.Bold),
+        SyntaxRule(r'\$[a-zA-Z_][a-zA-Z0-9_]*', '#9CDCFE'),  # Variables
+        SyntaxRule(r'".*?"|\'.*?\'', '#CE9178'),  # Strings
+        SyntaxRule(r'//.*?$|/\*.*?\*/', '#6A9955', italic=True),  # Comments
+        SyntaxRule(r'\b[0-9]+\b', '#B5CEA8'),
+    ],
+    'css': [
+        SyntaxRule(r'\.[\w\-]+', '#D7BA7D'),  # Class selectors
+        SyntaxRule(r'#[\w\-]+', '#C586C0'),  # ID selectors
+        SyntaxRule(r'\b[a-z\-]+\s*:', '#9CDCFE'),  # Property names
+        SyntaxRule(r':[a-z\-]+', '#DCDCAA'),  # Pseudo-selectors
+        SyntaxRule(r'{|}', '#D4D4D4'),  # Braces
+        SyntaxRule(r'"[^"]*"|\'[^\']*\'', '#CE9178'),  # Strings
+        SyntaxRule(r'/\*.*?\*/', '#6A9955', italic=True),  # Comments
+    ]
+}
+
+
 # ────── Code Editor with line numbers, bracket match & minimap stub ─────────
 class CodeEditor(QPlainTextEdit):
     def __init__(self):
@@ -638,11 +723,27 @@ class EditorArea(QWidget):
                 with open(path, 'r', encoding='latin-1', errors='replace') as f:
                     content = f.read()
             ed.setPlainText(content)
-        
+
+            ext = os.path.splitext(path)[1].lower()
+            rules = []
+
+            if ext == '.py':
+                rules = SYNTAX_RULES['python']
+            elif ext in ['.html', '.htm']:
+                rules = SYNTAX_RULES['html']
+            elif ext == '.php':
+                rules = SYNTAX_RULES['php']
+            elif ext == '.css':
+                rules = SYNTAX_RULES['css']
+
+            if rules:
+                ed.highlighter = CustomHighlighter(ed.document(), rules)
+
         idx = self.tabs.addTab(ed, os.path.basename(path) if path else "Untitled")
         self.tabs.setCurrentIndex(idx)
         ed.document().setModified(False)
         return ed
+
 
     def _open_image_tab(self, path):
         try:
