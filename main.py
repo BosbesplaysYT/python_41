@@ -404,13 +404,36 @@ class SearchWorker(QThread):
             pat = r'\b' + pat + r'\b'
         regex = re.compile(pat, flags)
 
+        include = self.opts['include']
+        exclude = self.opts['exclude']
+
         for dirpath, _, files in os.walk(self.root):
             for fn in files:
                 ext = os.path.splitext(fn)[1]
-                if self.opts['include'] and ext not in self.opts['include']:
+                # Check include patterns
+                if include:
+                    matched = False
+                    for pat in include:
+                        if pat.startswith('.') and ext == pat:
+                            matched = True
+                            break
+                        if not pat.startswith('.') and fn == pat:
+                            matched = True
+                            break
+                    if not matched:
+                        continue
+                # Check exclude patterns
+                skip = False
+                for pat in exclude:
+                    if pat.startswith('.') and ext == pat:
+                        skip = True
+                        break
+                    if not pat.startswith('.') and fn == pat:
+                        skip = True
+                        break
+                if skip:
                     continue
-                if ext in self.opts['exclude']:
-                    continue
+
                 full = os.path.join(dirpath, fn)
                 try:
                     with open(full, 'r', encoding='utf-8') as f:
@@ -1006,8 +1029,8 @@ class SearchDock(QDockWidget):
 
         # 4) File filters
         filt = QHBoxLayout()
-        self.include_ext = QLineEdit(); self.include_ext.setPlaceholderText("Include: .py,.js")
-        self.exclude_ext = QLineEdit(); self.exclude_ext.setPlaceholderText("Exclude: .min.js")
+        self.include_ext = QLineEdit(); self.include_ext.setPlaceholderText("Include: .py,utils.py")
+        self.exclude_ext = QLineEdit(); self.exclude_ext.setPlaceholderText("Exclude: .min.js,README.md")
         filt.addWidget(self.include_ext)
         filt.addWidget(self.exclude_ext)
         lay.addLayout(filt)
@@ -1066,8 +1089,8 @@ class SearchDock(QDockWidget):
             'regex':   self.use_regex.isChecked(),
             'case':    self.case_sensitive.isChecked(),
             'whole':   self.whole_word.isChecked(),
-            'include': set(e.strip() for e in self.include_ext.text().split(',') if e.strip()),
-            'exclude': set(e.strip() for e in self.exclude_ext.text().split(',') if e.strip()),
+            'include': [e.strip() for e in self.include_ext.text().split(',') if e.strip()],
+            'exclude': [e.strip() for e in self.exclude_ext.text().split(',') if e.strip()],
         }
         root = self.parent.project_dir
         pattern = self.find.text().strip()
@@ -1111,7 +1134,6 @@ class SearchDock(QDockWidget):
         tc = ed.textCursor()
         block = ed.document().findBlockByLineNumber(line-1)
         tc.setPosition(block.position() + start)
-        # correct enum usage here:
         tc.movePosition(QTextCursor.MoveOperation.Right,
                         QTextCursor.MoveMode.KeepAnchor,
                         length)
@@ -1121,7 +1143,6 @@ class SearchDock(QDockWidget):
         tc.insertText(self.rep.text())
 
         # 5) save file immediately
-        # reuse your MainWindow.save_file logic:
         mw = self.parent
         mw.editor_area.tabs.setCurrentIndex(self.last_tab)
         mw.save_file()
