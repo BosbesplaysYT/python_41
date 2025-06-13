@@ -3,13 +3,13 @@ import sys, os, json, subprocess, re, traceback, shutil
 import markdown
 from PIL import Image
 from PIL.ImageQt import ImageQt
-from PyQt6.QtGui import QColor, QFont, QPalette, QTextCharFormat, QTextCursor, QTextDocument, QFileSystemModel, QAction, QIcon, QPainter, QPixmap
+from PyQt6.QtGui import QColor, QFont, QPalette, QTextCharFormat, QTextCursor, QTextDocument, QFileSystemModel, QAction, QIcon, QPainter, QPixmap, QShortcut, QKeySequence
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QSplitter, QTabWidget, QPlainTextEdit,
     QTreeView, QDockWidget, QLineEdit, QPushButton, QListWidget,
     QTextEdit, QLabel, QVBoxLayout, QHBoxLayout, QMessageBox,
     QFileDialog, QInputDialog, QMenu, QAbstractItemView, QStackedWidget,
-    QCheckBox, QListWidgetItem
+    QCheckBox, QListWidgetItem, QHeaderView, QDialog
 )
 from PyQt6.QtCore import Qt, QTimer, QPoint, QSize, QRect, QThread, pyqtSignal, QStandardPaths, QUrl
 from PyQt6.QtWebEngineWidgets import QWebEngineView
@@ -293,6 +293,97 @@ QHeaderView::section {
     padding: 4px;
 }
 """
+
+class QuickOpenDialog(QDialog):
+    def __init__(self, open_callback, parent=None):
+        super().__init__(parent, flags=Qt.WindowType.FramelessWindowHint)
+        self.setModal(True)
+        self.open_callback = open_callback
+
+        # ── Build UI ────────────────────────────────────────────────────────
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(5, 5, 5, 5)
+
+        self.input = QLineEdit(self)
+        self.input.setPlaceholderText("Type to search files… (Esc to close)")
+        lay.addWidget(self.input)
+
+        self.list = QListWidget(self)
+        lay.addWidget(self.list)
+
+        # ── Signals ────────────────────────────────────────────────────────
+        self.input.textChanged.connect(self.on_filter)
+        self.list.itemActivated.connect(lambda item: self.open_and_close(item.text()))
+
+        # placeholder; will be refreshed on show
+        self.root = ""
+        self.files = []
+
+    def refresh_file_list(self):
+        """Read current project_dir from parent and re-walk the tree."""
+        parent = self.parent()
+        if not parent or not hasattr(parent, "project_dir"):
+            return
+
+        self.root = parent.project_dir
+        self.files = []
+        for dirpath, _, filenames in os.walk(self.root):
+            for fname in filenames:
+                rel = os.path.relpath(os.path.join(dirpath, fname), self.root)
+                self.files.append(rel)
+
+    def showEvent(self, ev):
+        """Before showing, update file list and reposition & resize."""
+        parent = self.parent()
+        if parent:
+            # 1) refresh to new project_dir
+            self.refresh_file_list()
+
+            # 2) resize to 60% of parent width
+            target_w = int(parent.width() * 0.6)
+            self.setFixedWidth(target_w)
+
+            # 3) center horizontally, 20px from top
+            geo = parent.geometry()
+            x = geo.x() + (geo.width() - self.width()) // 2
+            y = geo.y() + 20
+            self.move(x, y)
+
+        super().showEvent(ev)
+        self.input.clear()
+        self.list.clear()
+        self.input.setFocus()
+
+    def on_filter(self, text: str):
+        """Filter file list by substring, show up to 50 results."""
+        self.list.clear()
+        if not text:
+            return
+        lower = text.lower()
+        count = 0
+        for f in self.files:
+            if lower in f.lower():
+                self.list.addItem(QListWidgetItem(f))
+                count += 1
+                if count >= 50:
+                    break
+        if self.list.count():
+            self.list.setCurrentRow(0)
+
+    def open_and_close(self, relpath: str):
+        """Open selected file and close dialog."""
+        full = os.path.join(self.root, relpath)
+        self.open_callback(full)
+        self.close()
+
+    def keyPressEvent(self, ev):
+        # Esc to close, Down to go into list
+        if ev.key() == Qt.Key.Key_Escape:
+            self.close()
+        elif ev.key() == Qt.Key.Key_Down:
+            self.list.setFocus()
+        else:
+            super().keyPressEvent(ev)
 
 class SearchWorker(QThread):
     # file path, line number, line text
@@ -712,6 +803,13 @@ class ProjectSidebar(QWidget):
         self.model.setReadOnly(False)
         self.model.setRootPath(self.root)
         self.tree.setModel(self.model)
+        self.tree.hideColumn(1)
+        self.tree.hideColumn(2)
+        self.tree.hideColumn(3)
+
+        # make the “Name” column take up all available space
+        hdr = self.tree.header()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.tree.setRootIndex(self.model.index(self.root))
 
         # enable drag & drop
@@ -1216,6 +1314,14 @@ class MainWindow(QMainWindow):
         toggle_theme_act.setShortcut("Ctrl+T")
         toggle_theme_act.triggered.connect(self.toggle_theme)
         view_menu.addAction(toggle_theme_act)
+
+        # … inside MainWindow.__init__(), after you set up project_dir …
+        self.quick_open = QuickOpenDialog(
+            open_callback=lambda path: self.editor_area.new_tab(path),
+            parent=self
+        )
+        QShortcut(QKeySequence("Ctrl+P"), self).activated.connect(self.quick_open.show)
+
 
         # ─── Session state paths ──────────────────────────────────────────
         self.state_path = os.path.join(
