@@ -1563,7 +1563,7 @@ def main():
 
     def launch_main_window():
         w = MainWindow()
-        w.resize(1200, 800)
+        w.showMaximized()
         w.show()
 
     if is_first_launch():
